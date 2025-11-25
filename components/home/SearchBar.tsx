@@ -1,10 +1,17 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
 import React, { useMemo, useState } from 'react';
 import { Keyboard, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
-import type { Region } from 'react-native-maps';
 import { useTheme } from '../../context/ThemeContext';
-import Constants from 'expo-constants';
+
+// Local Region type definition (no longer using react-native-maps)
+type Region = {
+    latitude: number;
+    longitude: number;
+    latitudeDelta: number;
+    longitudeDelta: number;
+};
 
 type AppColors = ReturnType<typeof useTheme>['colors'];
 

@@ -1,33 +1,28 @@
 // File: app/station/[id].tsx
-import { FontAwesome, MaterialCommunityIcons } from '@expo/vector-icons';
+import { FontAwesome } from '@expo/vector-icons';
+import MapLibreGL from '@maplibre/maplibre-react-native';
 import { useIsFocused } from '@react-navigation/native';
 import Constants from 'expo-constants';
-import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
 import * as Location from 'expo-location';
-import React, { useEffect, useState, useMemo } from 'react';
-// CHANGE: Import the 'Image' component
-import { View, Text, StyleSheet, ActivityIndicator, ScrollView, Pressable, Alert, Platform, Linking, Image } from 'react-native';
-import MapView, { Marker } from 'react-native-maps';
-import MapViewDirections from 'react-native-maps-directions';
+import { Stack, useLocalSearchParams, useRouter } from 'expo-router';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, Image, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import StationIcon from '../../../components/StationIcon';
+import { MAPLIBRE_STYLES } from '../../../constants/MapStyle';
 import { useAuth } from '../../../context/AuthContext';
 import { useTheme } from '../../../context/ThemeContext';
 import { supabase } from '../../../lib/supabase';
-import { createMapStyle } from '../../../constants/MapStyle';
-// CHANGE: Import your custom StationIcon component
-import StationIcon from '../../../components/StationIcon';
 
 type AppColors = ReturnType<typeof useTheme>['colors'];
 
 const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey || Constants.expoConfig?.web?.config?.googleMaps?.apiKey;
 
-// --- (Helper functions remain the same) ---
+// Helper functions
 function haversineDistance(lat1: number, lon1: number, lat2: number, lon2: number): number { const R = 6371e3; const phi1 = lat1 * Math.PI / 180, phi2 = lat2 * Math.PI / 180; const dPhi = (lat2 - lat1) * Math.PI / 180, dLambda = (lon2 - lon1) * Math.PI / 180; const a = Math.sin(dPhi / 2) * Math.sin(dPhi / 2) + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dLambda / 2) * Math.sin(dLambda / 2); return 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)) * R; }
 function calculateTravelTime(distanceMeters: number): { walk: string; run: string; drive: string } { const walkSpeedKph = 5, runSpeedKph = 10, driveSpeedKph = 30; const toMinutes = (speedKph: number) => Math.round(distanceMeters / 1000 / speedKph * 60); const formatTime = (minutes: number) => { if (minutes < 1) return "< 1 min"; if (minutes < 60) return `${minutes} min`; return `${Math.floor(minutes / 60)}h ${minutes % 60}m`; }; return { walk: formatTime(toMinutes(walkSpeedKph)), run: formatTime(toMinutes(runSpeedKph)), drive: formatTime(toMinutes(driveSpeedKph > 0 ? driveSpeedKph : 1)) }; }
 function formatTimestamp(dateString: string): string { const date = new Date(dateString); const now = new Date(); const hours = Math.floor((now.getTime() - date.getTime()) / 1000 / 3600); if (hours < 1) return 'Updated just now'; if (hours < 24) return `Updated ${hours}h ago`; return `On ${date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}`; }
 function normalizeFuelName(dbName: string): string { const name = dbName.toLowerCase(); if (name.includes('pms') || name.includes('petrol')) return 'Petrol'; if (name.includes('gas')) return 'Gas'; if (name.includes('diesel') || name.includes('ago')) return 'Diesel'; if (name.includes('kerosine') || name.includes('dpk')) return 'Kerosine'; return dbName.charAt(0).toUpperCase() + dbName.slice(1); }
 
-
-// CHANGE: Add logo_url to the StationDetails type
 type StationDetails = { id: number; name: string; latitude: number; longitude: number; brand: string | null; amenities: string[] | null; payment_methods: string[] | null; logo_url: string | null; };
 type PriceReport = { id: number; user_id: string; fuel_type: string; price: number | null; notes: string | null; rating: number | null; created_at: string; profiles: { full_name: string | null; avatar_url?: string; } | null; other_fuel_prices: { [key: string]: number } | null; amenities_update: { add: string[] } | null; payment_methods_update: { add: string[] } | null; };
 type Coords = { latitude: number; longitude: number; };
@@ -47,12 +42,11 @@ export default function StationProfileScreen() {
     const isFocused = useIsFocused();
     const { theme, colors } = useTheme();
     const styles = useMemo(() => getThemedStyles(colors), [colors]);
-    const themedMapStyle = useMemo(() => createMapStyle(colors.map), [colors]);
+    const cameraRef = useRef<MapLibreGL.Camera>(null);
 
     const [station, setStation] = useState<StationDetails | null>(null);
     const [reports, setReports] = useState<PriceReport[]>([]);
     const [loading, setLoading] = useState(true);
-    // ... (rest of state variables are unchanged) ...
     const [isCheckingLocation, setIsCheckingLocation] = useState(false);
     const [userLocation, setUserLocation] = useState<Coords | null>(null);
     const [distance, setDistance] = useState<number | null>(null);
@@ -60,14 +54,41 @@ export default function StationProfileScreen() {
     const [historyIndex, setHistoryIndex] = useState<{ [key: string]: number }>({});
     const [isAmenitiesExpanded, setIsAmenitiesExpanded] = useState(false);
     const [isCommentsExpanded, setIsCommentsExpanded] = useState(false);
+    const [routeGeometry, setRouteGeometry] = useState<GeoJSON.LineString | null>(null);
 
-    // The fetchAllData and other effects/memos remain the same, as `select('*')` already gets the logo_url column
+    // Fetch route from OSRM when user location and station are available
+    useEffect(() => {
+        const fetchRoute = async () => {
+            if (!userLocation || !station) {
+                setRouteGeometry(null);
+                return;
+            }
+
+            try {
+                const origin = `${userLocation.longitude},${userLocation.latitude}`;
+                const destination = `${station.longitude},${station.latitude}`;
+                const url = `https://router.project-osrm.org/route/v1/driving/${origin};${destination}?overview=full&geometries=geojson`;
+
+                const response = await fetch(url);
+                const data = await response.json();
+
+                if (data.code === 'Ok' && data.routes && data.routes.length > 0) {
+                    setRouteGeometry(data.routes[0].geometry);
+                }
+            } catch (error) {
+                console.error('Failed to fetch route:', error);
+                setRouteGeometry(null);
+            }
+        };
+
+        fetchRoute();
+    }, [userLocation, station]);
+
     useEffect(() => {
         const fetchAllData = async () => {
             if (!id) return;
             setLoading(true);
             try {
-                // select('*') will fetch the logo_url if it exists in the table
                 const stationPromise = supabase.from('stations').select('*').eq('id', id).single();
                 const reportsPromise = supabase.from('price_reports').select('*, profiles(full_name, avatar_url)').eq('station_id', id).order('created_at', { ascending: false });
                 const [{ data: stationData, error: stationError }, { data: reportsData, error: reportsError }] = await Promise.all([stationPromise, reportsPromise]);
@@ -109,12 +130,42 @@ export default function StationProfileScreen() {
         return { priceHistories: histories, allAmenities: Array.from(new Set([...amenitySet, ...paymentSet])), ratingSummary: { average: averageRating, count: ratingCount, distribution: ratingDistribution }, leaderboard: sortedLeaderboard };
     }, [reports, station]);
 
-    // ... (handler functions remain unchanged) ...
     const handleReportPress = async () => { if (!user) { Alert.alert("Login Required", "You must be signed in to submit a report."); return; } if (!station) return; setIsCheckingLocation(true); try { const location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }); const dist = haversineDistance(location.coords.latitude, location.coords.longitude, station.latitude, station.longitude); if (dist <= 200) { router.push(`/report/submit?stationId=${station.id}&stationName=${station.name}&lat=${station.latitude}&lon=${station.longitude}`); } else { Alert.alert("Too Far Away", `You must be within 200 meters of this station. You are currently about ${Math.round(dist)} meters away.`); } } catch (error) { Alert.alert("Location Error", "Could not get your current location."); } finally { setIsCheckingLocation(false); } };
     const handleHistoryNavigation = (fuel: string, direction: 'newer' | 'older') => { const history = priceHistories.get(fuel) || []; const maxIndex = history.length > 0 ? history.length - 1 : 0; setHistoryIndex(prev => { const currentIndex = prev[fuel] || 0; if (direction === 'older' && currentIndex < maxIndex) return { ...prev, [fuel]: currentIndex + 1 }; if (direction === 'newer' && currentIndex > 0) return { ...prev, [fuel]: currentIndex - 1 }; return prev; }); };
     const handleTakeMeThere = () => { if (!station) return; const { latitude, longitude, name } = station; const scheme = Platform.select({ ios: 'maps:0,0?q=', android: 'geo:0,0?q=' }); const latLng = `${latitude},${longitude}`; const label = encodeURIComponent(name); const url = Platform.select({ ios: `${scheme}${label}@${latLng}`, android: `${scheme}${latLng}(${label})` }); if (url) { Linking.openURL(url).catch(() => Alert.alert("Error", "Could not open maps application.")); } };
     const handleWriteReviewPress = async () => { if (!user) { Alert.alert("Login Required", "You must be signed in to write a review."); return; } if (!station) return; setIsCheckingLocation(true); try { const location = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High }); const dist = haversineDistance(location.coords.latitude, location.coords.longitude, station.latitude, station.longitude); if (dist <= 200) { router.push(`/report/reportchat?stationId=${station.id}&stationName=${station.name}`); } else { Alert.alert("Too Far Away", `You must be within 200 meters of this station to write a review. You are currently about ${Math.round(dist)} meters away.`); } } catch (error) { Alert.alert("Location Error", "Could not get your current location."); } finally { setIsCheckingLocation(false); } };
-    
+
+    // GeoJSON for station marker
+    const stationMarkerGeoJSON: GeoJSON.FeatureCollection = useMemo(() => {
+        if (!station) return { type: 'FeatureCollection', features: [] };
+        return {
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                geometry: {
+                    type: 'Point',
+                    coordinates: [station.longitude, station.latitude]
+                },
+                properties: {
+                    id: station.id,
+                    name: station.name
+                }
+            }]
+        };
+    }, [station]);
+
+    // GeoJSON for route
+    const routeGeoJSON: GeoJSON.FeatureCollection = useMemo(() => {
+        if (!routeGeometry) return { type: 'FeatureCollection', features: [] };
+        return {
+            type: 'FeatureCollection',
+            features: [{
+                type: 'Feature',
+                geometry: routeGeometry,
+                properties: {}
+            }]
+        };
+    }, [routeGeometry]);
 
     if (loading) { return <View style={styles.centered}><ActivityIndicator size="large" color={colors.primary} /></View>; }
     if (!station) { return <View style={styles.centered}><Text style={styles.stationBrand}>Station not found.</Text></View>; }
@@ -127,30 +178,71 @@ export default function StationProfileScreen() {
         <ScrollView style={styles.container} contentContainerStyle={styles.scrollContentContainer}>
             <Stack.Screen options={{ title: 'Station Details', headerTintColor: colors.primary, headerStyle: { backgroundColor: colors.card }, headerTitleStyle: { color: colors.text } }} />
             <View style={styles.header}><Text style={styles.stationName}>{station.name}</Text><Text style={styles.stationBrand}>{station.brand || "Brand not specified"}</Text></View>
-            <MapView style={styles.map} initialRegion={{ latitude: station.latitude, longitude: station.longitude, latitudeDelta: 0.04, longitudeDelta: 0.04 }} showsUserLocation={true} customMapStyle={theme === 'dark' ? themedMapStyle : []}><Marker coordinate={{ latitude: station.latitude, longitude: station.longitude }} pinColor={colors.primary} title={station.name} />{userLocation && GOOGLE_MAPS_API_KEY && <MapViewDirections origin={userLocation} destination={{ latitude: station.latitude, longitude: station.longitude }} apikey={GOOGLE_MAPS_API_KEY} strokeWidth={4} strokeColor={colors.primary} />}</MapView>
+
+            <MapLibreGL.MapView
+                style={styles.map}
+                styleURL={theme === 'dark' ? MAPLIBRE_STYLES.dark : MAPLIBRE_STYLES.light}
+                logoEnabled={false}
+                attributionEnabled={false}
+            >
+                <MapLibreGL.Camera
+                    ref={cameraRef}
+                    centerCoordinate={[station.longitude, station.latitude]}
+                    zoomLevel={13}
+                />
+
+                <MapLibreGL.UserLocation visible={true} />
+
+                {/* Station marker */}
+                <MapLibreGL.ShapeSource id="station-marker" shape={stationMarkerGeoJSON}>
+                    <MapLibreGL.SymbolLayer
+                        id="station-icon"
+                        style={{
+                            iconImage: 'marker-15',
+                            iconSize: 1.5,
+                            iconColor: colors.primary,
+                            iconAllowOverlap: true,
+                        }}
+                    />
+                </MapLibreGL.ShapeSource>
+
+                {/* Route line */}
+                {routeGeometry && (
+                    <MapLibreGL.ShapeSource id="route-source" shape={routeGeoJSON}>
+                        <MapLibreGL.LineLayer
+                            id="route-line"
+                            style={{
+                                lineColor: colors.primary,
+                                lineWidth: 4,
+                                lineCap: 'round',
+                                lineJoin: 'round',
+                            }}
+                        />
+                    </MapLibreGL.ShapeSource>
+                )}
+            </MapLibreGL.MapView>
+
             <View style={styles.content}>
                 <View style={styles.detailsCard}>
                     <View style={styles.stationIconContainer}>
-                        {/* CHANGE: Replace the gas station icon with conditional logic */}
                         {station.logo_url ? (
                             <Image source={{ uri: station.logo_url }} style={styles.stationLogoImage} resizeMode="contain" />
                         ) : (
                             <StationIcon color={colors.primary} width={40} height={40} />
                         )}
                     </View>
-                    <View style={styles.detailRatingRow}><FontAwesome name="star" size={18} color={colors.accent} style={{marginRight: 7}}/><Text style={styles.detailRatingText}>{ratingSummary.average} ({ratingSummary.count} reviews)</Text></View>
+                    <View style={styles.detailRatingRow}><FontAwesome name="star" size={18} color={colors.accent} style={{ marginRight: 7 }} /><Text style={styles.detailRatingText}>{ratingSummary.average} ({ratingSummary.count} reviews)</Text></View>
                     <Text style={styles.detailAddressText}>Address details not available</Text>
-                    <View style={styles.detailHoursRow}><FontAwesome name="clock-o" size={20} color={colors.textSecondary} style={{marginRight: 8}}/><Text style={styles.detailHoursText}>{allAmenities.includes("Open 24/7") ? "Open 24/7" : "Hours not specified"}</Text></View>
+                    <View style={styles.detailHoursRow}><FontAwesome name="clock-o" size={20} color={colors.textSecondary} style={{ marginRight: 8 }} /><Text style={styles.detailHoursText}>{allAmenities.includes("Open 24/7") ? "Open 24/7" : "Hours not specified"}</Text></View>
                     <Pressable style={styles.takeMeThereButton} onPress={handleTakeMeThere}><Text style={styles.takeMeThereButtonText}>Take me there</Text></Pressable>
                 </View>
-                
-                {/* ... (Rest of the JSX remains exactly the same) ... */}
-                <View style={styles.priceReportContainer}><View style={styles.priceReportHeader}><Text style={styles.priceReportTitle}>Station Price</Text></View>{ALL_FUEL_TYPES.map(fuel => { const history = priceHistories.get(fuel) || []; const currentIndex = historyIndex[fuel] || 0; const currentData = history[currentIndex]; const isNewerDisabled = currentIndex === 0; const isOlderDisabled = currentIndex >= history.length - 1; return (<View key={fuel} style={styles.priceRow}><Text style={styles.fuelNameText}>{fuel}</Text><View style={styles.priceInteractionWrapper}><Pressable onPress={() => handleHistoryNavigation(fuel, 'newer')} disabled={isNewerDisabled} style={styles.arrowButton}><FontAwesome name="chevron-left" size={16} color={isNewerDisabled ? colors.disabled : colors.primary} /></Pressable><View style={styles.priceInfoBox}>{currentData ? (<><Text style={styles.priceValueText}>₦{currentData.price}/{fuel === 'Gas' ? 'KG' : 'L'}</Text><Text style={styles.priceTimestampText}>{formatTimestamp(currentData.created_at)}</Text></>) : <Text style={styles.priceValueText}>N/A</Text>}</View><Pressable onPress={() => handleHistoryNavigation(fuel, 'older')} disabled={isOlderDisabled} style={styles.arrowButton}><FontAwesome name="chevron-right" size={16} color={isOlderDisabled ? colors.disabled : colors.primary} /></Pressable></View></View>);})}<Pressable style={[styles.reportPriceButton, isCheckingLocation && styles.buttonDisabled]} onPress={handleReportPress} disabled={isCheckingLocation}>{isCheckingLocation ? <ActivityIndicator color={colors.primaryText} /> : <Text style={styles.reportPriceButtonText}>Report Price</Text>}</Pressable></View>
+
+                <View style={styles.priceReportContainer}><View style={styles.priceReportHeader}><Text style={styles.priceReportTitle}>Station Price</Text></View>{ALL_FUEL_TYPES.map(fuel => { const history = priceHistories.get(fuel) || []; const currentIndex = historyIndex[fuel] || 0; const currentData = history[currentIndex]; const isNewerDisabled = currentIndex === 0; const isOlderDisabled = currentIndex >= history.length - 1; return (<View key={fuel} style={styles.priceRow}><Text style={styles.fuelNameText}>{fuel}</Text><View style={styles.priceInteractionWrapper}><Pressable onPress={() => handleHistoryNavigation(fuel, 'newer')} disabled={isNewerDisabled} style={styles.arrowButton}><FontAwesome name="chevron-left" size={16} color={isNewerDisabled ? colors.disabled : colors.primary} /></Pressable><View style={styles.priceInfoBox}>{currentData ? (<><Text style={styles.priceValueText}>₦{currentData.price}/{fuel === 'Gas' ? 'KG' : 'L'}</Text><Text style={styles.priceTimestampText}>{formatTimestamp(currentData.created_at)}</Text></>) : <Text style={styles.priceValueText}>N/A</Text>}</View><Pressable onPress={() => handleHistoryNavigation(fuel, 'older')} disabled={isOlderDisabled} style={styles.arrowButton}><FontAwesome name="chevron-right" size={16} color={isOlderDisabled ? colors.disabled : colors.primary} /></Pressable></View></View>); })}<Pressable style={[styles.reportPriceButton, isCheckingLocation && styles.buttonDisabled]} onPress={handleReportPress} disabled={isCheckingLocation}>{isCheckingLocation ? <ActivityIndicator color={colors.primaryText} /> : <Text style={styles.reportPriceButtonText}>Report Price</Text>}</Pressable></View>
                 <View style={styles.cardContainer}><Text style={styles.cardTitle}>Travel Estimates</Text>{distance !== null && travelTimes ? (<View style={styles.travelGrid}><View style={styles.travelBox}><FontAwesome name="male" size={28} color={colors.text} /><Text style={styles.travelTime}>{travelTimes.walk}</Text><Text style={styles.travelLabel}>Walk</Text></View><View style={styles.travelBox}><FontAwesome name="rocket" size={28} color={colors.text} /><Text style={styles.travelTime}>{travelTimes.run}</Text><Text style={styles.travelLabel}>Run</Text></View><View style={styles.travelBox}><FontAwesome name="car" size={28} color={colors.text} /><Text style={styles.travelTime}>{travelTimes.drive}</Text><Text style={styles.travelLabel}>Vehicle</Text></View></View>) : <Text style={styles.noDataText}>Calculating travel times...</Text>}</View>
                 <View style={styles.cardContainer}><Text style={styles.cardTitle}>Amenities</Text>{allAmenities.length > 0 ? (<View style={styles.amenitiesGrid}>{amenitiesToShow.map(item => (<View key={item} style={styles.amenityItem}><View style={styles.amenityIconContainer}><FontAwesome name={amenityIcons[item] || 'check-circle'} size={24} color={colors.text} /></View><Text style={styles.amenityText}>{item}</Text></View>))}</View>) : <Text style={styles.noDataText}>No amenities reported yet.</Text>}{allAmenities.length > INITIAL_AMENITIES_LIMIT && (<Pressable style={styles.viewAllButton} onPress={() => setIsAmenitiesExpanded(!isAmenitiesExpanded)}><Text style={styles.viewAllButtonText}>{isAmenitiesExpanded ? 'Show Less' : 'View all amenities'}</Text></Pressable>)}</View>
-                <View style={styles.cardContainer}><Text style={styles.cardTitle}>Ratings & Comments ({ratingSummary.count})</Text>{ratingSummary.count > 0 && (<View style={styles.ratingsSummaryContainer}><View style={styles.ratingDistribution}>{[5, 4, 3, 2, 1].map(star => (<View key={star} style={styles.ratingBarRow}><Text style={styles.ratingBarLabel}>{star}</Text><FontAwesome name="star" size={14} color={colors.accent} style={{marginHorizontal: 4}}/><View style={styles.ratingBarBackground}><View style={[styles.ratingBarForeground, { width: `${(ratingSummary.distribution[star] / ratingSummary.count) * 100}%` }]} /></View></View>))}</View><View style={styles.averageRatingBox}><Text style={styles.averageRatingValue}>{ratingSummary.average}</Text><Text style={styles.averageRatingLabel}>out of 5</Text></View></View>)}<View style={styles.commentList}>{commentsToShow.length > 0 ? commentsToShow.map((report, index) => (<View key={report.id} style={[styles.commentCard, index === commentsToShow.length - 1 && styles.lastCommentCard]}><View style={styles.commentHeader}><View style={styles.commentUser}><FontAwesome name="user-circle" size={38} color={colors.textSecondary}/><View><Text style={styles.commentUserName}>{report.profiles?.full_name || 'A User'}</Text><View style={styles.commentRating}>{Array.from({length: 5}).map((_, i) => <FontAwesome key={i} name="star" size={14} color={i < (report.rating || 0) ? colors.accent : colors.disabled} />)}</View></View></View><Text style={styles.commentTimestamp}>{formatTimestamp(report.created_at).replace('Updated ', '')}</Text></View><Text style={styles.commentText}>{report.notes}</Text></View>)) : <Text style={styles.noDataText}>No comments yet.</Text>}</View>
-                <Pressable style={[styles.writeReviewButton, isCheckingLocation && styles.buttonDisabled]} onPress={handleWriteReviewPress} disabled={isCheckingLocation}>{isCheckingLocation ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.writeReviewButtonText}>Write Review</Text>}</Pressable>
-                {reportsWithComments.length > INITIAL_COMMENTS_LIMIT && (<Pressable style={styles.viewAllButton} onPress={() => setIsCommentsExpanded(!isCommentsExpanded)}><Text style={styles.viewAllButtonText}>{isCommentsExpanded ? 'Show Less' : 'View all comments'}</Text></Pressable>)}</View>
+                <View style={styles.cardContainer}><Text style={styles.cardTitle}>Ratings & Comments ({ratingSummary.count})</Text>{ratingSummary.count > 0 && (<View style={styles.ratingsSummaryContainer}><View style={styles.ratingDistribution}>{[5, 4, 3, 2, 1].map(star => (<View key={star} style={styles.ratingBarRow}><Text style={styles.ratingBarLabel}>{star}</Text><FontAwesome name="star" size={14} color={colors.accent} style={{ marginHorizontal: 4 }} /><View style={styles.ratingBarBackground}><View style={[styles.ratingBarForeground, { width: `${(ratingSummary.distribution[star] / ratingSummary.count) * 100}%` }]} /></View></View>))}</View><View style={styles.averageRatingBox}><Text style={styles.averageRatingValue}>{ratingSummary.average}</Text><Text style={styles.averageRatingLabel}>out of 5</Text></View></View>)}<View style={styles.commentList}>{commentsToShow.length > 0 ? commentsToShow.map((report, index) => (<View key={report.id} style={[styles.commentCard, index === commentsToShow.length - 1 && styles.lastCommentCard]}><View style={styles.commentHeader}><View style={styles.commentUser}><FontAwesome name="user-circle" size={38} color={colors.textSecondary} /><View><Text style={styles.commentUserName}>{report.profiles?.full_name || 'A User'}</Text><View style={styles.commentRating}>{Array.from({ length: 5 }).map((_, i) => <FontAwesome key={i} name="star" size={14} color={i < (report.rating || 0) ? colors.accent : colors.disabled} />)}</View></View></View><Text style={styles.commentTimestamp}>{formatTimestamp(report.created_at).replace('Updated ', '')}</Text></View><Text style={styles.commentText}>{report.notes}</Text></View>)) : <Text style={styles.noDataText}>No comments yet.</Text>}</View>
+                    <Pressable style={[styles.writeReviewButton, isCheckingLocation && styles.buttonDisabled]} onPress={handleWriteReviewPress} disabled={isCheckingLocation}>{isCheckingLocation ? <ActivityIndicator color="#FFFFFF" /> : <Text style={styles.writeReviewButtonText}>Write Review</Text>}</Pressable>
+                    {reportsWithComments.length > INITIAL_COMMENTS_LIMIT && (<Pressable style={styles.viewAllButton} onPress={() => setIsCommentsExpanded(!isCommentsExpanded)}><Text style={styles.viewAllButtonText}>{isCommentsExpanded ? 'Show Less' : 'View all comments'}</Text></Pressable>)}</View>
                 {leaderboard.length > 0 && (<View style={styles.cardContainer}><View style={styles.leaderboardHeader}><Text style={styles.leaderboardTitle}>Top update gurus</Text><Text style={styles.leaderboardTimespan}>Last 30 days</Text></View><View style={styles.leaderboardList}>{leaderboard.map((guru, index) => (<View key={guru.userId} style={styles.leaderboardRow}><Text style={styles.leaderboardRank}>{index + 1}</Text><FontAwesome name="user-circle" size={26} color={colors.textSecondary} style={styles.leaderboardAvatar} /><Text style={styles.leaderboardName} numberOfLines={1}>{guru.fullName}</Text><Text style={styles.leaderboardCount}>{guru.reportCount}</Text></View>))}</View></View>)}
             </View>
         </ScrollView>
@@ -168,7 +260,6 @@ const getThemedStyles = (colors: AppColors) => StyleSheet.create({
     content: { padding: 20 },
     detailsCard: { backgroundColor: colors.card, borderRadius: 12, padding: 20, alignItems: 'center', marginBottom: 20, ...Platform.select({ ios: { shadowColor: colors.shadow, shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.1, shadowRadius: 5 }, android: { elevation: 5 } }) },
     stationIconContainer: { width: 80, height: 80, borderRadius: 40, backgroundColor: colors.background, justifyContent: 'center', alignItems: 'center', marginBottom: 12, borderWidth: 1, borderColor: colors.border },
-    // CHANGE: Added style for the station logo image
     stationLogoImage: { width: '80%', height: '80%' },
     detailRatingRow: { flexDirection: 'row', alignItems: 'center', marginBottom: 8 },
     detailRatingText: { fontSize: 16, fontWeight: '600', color: colors.text },
@@ -177,7 +268,6 @@ const getThemedStyles = (colors: AppColors) => StyleSheet.create({
     detailHoursText: { fontSize: 14, fontWeight: '500', color: colors.textSecondary },
     takeMeThereButton: { backgroundColor: colors.primary, paddingVertical: 12, paddingHorizontal: 40, borderRadius: 8, width: '80%', alignItems: 'center' },
     takeMeThereButtonText: { color: colors.primaryText, fontSize: 16, fontWeight: 'bold' },
-    // ... (rest of styles are unchanged) ...
     buttonDisabled: { opacity: 0.7 },
     noDataText: { color: colors.textSecondary, fontStyle: 'italic', textAlign: 'center', padding: 20 },
     cardContainer: { backgroundColor: colors.card, borderRadius: 10, padding: 15, marginBottom: 20, ...Platform.select({ ios: { shadowColor: colors.shadow, shadowOffset: { width: 1, height: 2 }, shadowOpacity: 0.3, shadowRadius: 4 }, android: { elevation: 4 } }) },

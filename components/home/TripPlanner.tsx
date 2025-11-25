@@ -1,17 +1,24 @@
 import { MaterialCommunityIcons } from '@expo/vector-icons';
+import Constants from 'expo-constants';
 import React, { useMemo, useState } from 'react';
 import { Modal, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
-import type { Region } from 'react-native-maps';
 import { useTheme } from '../../context/ThemeContext';
-import Constants from 'expo-constants';
+
+// Local Region type definition (no longer using react-native-maps)
+type Region = {
+    latitude: number;
+    longitude: number;
+    latitudeDelta: number;
+    longitudeDelta: number;
+};
 
 type AppColors = ReturnType<typeof useTheme>['colors'];
 
 const GOOGLE_MAPS_API_KEY = Constants.expoConfig?.extra?.googleMapsApiKey || Constants.expoConfig?.web?.config?.googleMaps?.apiKey;
 
 type TripSearchScope = 'city' | 'country';
-const TRIP_SCOPE_OPTIONS: { label: string; value: TripSearchScope }[] = [ { label: 'City', value: 'city' }, { label: 'Country', value: 'country' } ];
+const TRIP_SCOPE_OPTIONS: { label: string; value: TripSearchScope }[] = [{ label: 'City', value: 'city' }, { label: 'Country', value: 'country' }];
 
 interface TripPlannerProps {
     isTripModeActive: boolean;
